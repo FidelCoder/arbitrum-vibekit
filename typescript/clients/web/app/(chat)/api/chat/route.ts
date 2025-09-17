@@ -24,8 +24,9 @@ import { generateTitleFromUserMessage } from '../../actions';
 // import { requestSuggestions } from '@/lib/ai/tools/request-suggestions';
 // import { getWeather } from '@/lib/ai/tools/get-weather';
 import { isProductionEnvironment } from '@/lib/constants';
-import { openRouterProvider } from '@/lib/ai/providers';
+import { openAIProvider } from '@/lib/ai/providers';
 import { getTools as getDynamicTools } from '@/lib/ai/tools/tool-agents';
+// import { generateChart } from '@/lib/ai/tools/generate-chart'; // Now using MCP server
 
 import type { Session } from 'next-auth';
 
@@ -50,15 +51,11 @@ export async function POST(request: Request) {
       messages: Array<UIMessage>;
       selectedChatModel: string;
       context: Context;
-      } = await request.json();
+    } = await request.json();
 
     const session: Session | null = await auth();
 
-    console.log('session', session);
-
     const validationResult = ContextSchema.safeParse(context);
-
-    console.log('validationResult', validationResult);
 
     if (!validationResult.success) {
       return new Response(JSON.stringify(validationResult.error.errors), {
@@ -81,122 +78,158 @@ export async function POST(request: Request) {
       return new Response('No user message found', { status: 400 });
     }
 
-    const chat = await getChatById({ id });
+    let chat;
+    try {
+      chat = await getChatById({ id });
+    } catch (error) {
+      console.error('Error getting chat by ID:', error);
+      throw error;
+    }
 
     if (!chat) {
-      const title = await generateTitleFromUserMessage({
-        message: userMessage,
-      });
+      try {
+        const title = await generateTitleFromUserMessage({
+          message: userMessage,
+        });
 
-      await saveChat({ id, userId: session.user.id, title, address: validatedContext.walletAddress || "" });
+      } catch (error) {
+        console.error(
+          '[ROUTE] Error in title generation or chat saving:',
+          error,
+        );
+        throw error; // Re-throw to be caught by outer try-catch
+      }
     } else {
       if (chat.userId !== session.user.id) {
+        console.log('[ROUTE] Unauthorized chat access attempt');
         return new Response('Unauthorized', { status: 401 });
       }
     }
 
-    await saveMessages({
-      messages: [
-        {
-          chatId: id,
-          id: userMessage.id,
-          role: 'user',
-          parts: userMessage.parts,
-          attachments: userMessage.experimental_attachments ?? [],
-          createdAt: new Date(),
-        },
-      ],
-    });
+    try {
+      await saveMessages({
+        messages: [
+          {
+            chatId: id,
+            id: userMessage.id,
+            role: 'user',
+            parts: userMessage.parts,
+            attachments: userMessage.experimental_attachments ?? [],
+            createdAt: new Date(),
+          },
+        ],
+      });
+    } catch (error) {
+      console.error('[ROUTE] Error saving user message:', error);
+      throw error;
+    }
 
     console.log('Chat ID:', id);
     // Get dynamic tools
-    const dynamicTools = await getDynamicTools();
-
-    console.log('Dynamic tools:', dynamicTools);
+    let dynamicTools;
+    try {
+      dynamicTools = await getDynamicTools();
+      console.log('Dynamic tools:', dynamicTools);
+    } catch (error) {
+      console.error('Error getting dynamic tools:', error);
+      dynamicTools = {}; // Use empty object as fallback
+    }
 
     return createDataStreamResponse({
       execute: (dataStream) => {
+        console.log('[ROUTE] Executing stream...');
+
         const result = streamText({
-          model: openRouterProvider.languageModel(selectedChatModel),
-          system: systemPrompt({
-            selectedChatModel,
-            walletAddress: validatedContext.walletAddress,
-          }),
-          messages,
-          maxSteps: 20,
-          experimental_transform: smoothStream({ chunking: 'word' }),
-          experimental_generateMessageId: generateUUID,
-          tools: {
-            //getWeather,
-            //createDocument: createDocument({ session, dataStream }),
-            //updateDocument: updateDocument({ session, dataStream }),
-            //requestSuggestions: requestSuggestions({
-            //  session,
-            //  dataStream,
-            //}),
-            ...dynamicTools,
-          },
-          onFinish: async ({ response }) => {
-            if (session.user?.id) {
-              try {
-                const assistantId = getTrailingMessageId({
-                  messages: response.messages.filter(
-                    (message) => message.role === 'assistant',
-                  ),
-                });
+            model,
+            system: systemPromptText,
+            messages,
+            maxSteps: 20,
+            experimental_transform: smoothStream({ chunking: 'word' }),
+            experimental_generateMessageId: generateUUID,
+            tools: {
+              //getWeather,
+              //createDocument: createDocument({ session, dataStream }),
+              //updateDocument: updateDocument({ session, dataStream }),
+              //requestSuggestions: requestSuggestions({
+              //  session,
+              //  dataStream,
+              //}),
+              ...dynamicTools,
+              // generateChart, // Now handled by MCP server via dynamicTools
+            },
+            onFinish: async ({ response }) => {
+              console.log('🔍 [ROUTE] StreamText finished');
+              if (session.user?.id) {
+                try {
+                  const assistantId = getTrailingMessageId({
+                    messages: response.messages.filter(
+                      (message) => message.role === 'assistant',
+                    ),
+                  });
 
-                if (!assistantId) {
-                  throw new Error('No assistant message found!');
+                  if (!assistantId) {
+                    throw new Error('No assistant message found!');
+                  }
+
+                  const [, assistantMessage] = appendResponseMessages({
+                    messages: [userMessage],
+                    responseMessages: response.messages,
+                  });
+
+                  await saveMessages({
+                    messages: [
+                      {
+                        id: assistantId,
+                        chatId: id,
+                        role: assistantMessage.role,
+                        parts: assistantMessage.parts,
+                        attachments:
+                          assistantMessage.experimental_attachments ?? [],
+                        createdAt: new Date(),
+                      },
+                    ],
+                  });
+                } catch (saveError) {
+                  console.error(
+                    '[ROUTE] Failed to save assistant response:',
+                    saveError,
+                  );
                 }
-
-                const [, assistantMessage] = appendResponseMessages({
-                  messages: [userMessage],
-                  responseMessages: response.messages,
-                });
-
-                await saveMessages({
-                  messages: [
-                    {
-                      id: assistantId,
-                      chatId: id,
-                      role: assistantMessage.role,
-                      parts: assistantMessage.parts,
-                      attachments:
-                        assistantMessage.experimental_attachments ?? [],
-                      createdAt: new Date(),
-                    },
-                  ],
-                });
-              } catch (_) {
-                console.error('Failed to save chat');
               }
-            }
-          },
-          experimental_telemetry: {
-            isEnabled: isProductionEnvironment,
-            functionId: 'stream-text',
-          },
-        });
+            },
+            experimental_telemetry: {
+              isEnabled: isProductionEnvironment,
+              functionId: 'stream-text',
+            },
+          });
 
-        console.log('FN RES', result);
-
-        // result.consumeStream(); // Calling consumeStream() here buffers the entire response server-side, preventing streaming to the client.
-
-        result.mergeIntoDataStream(dataStream, {
-          sendReasoning: true,
-        });
+          result.mergeIntoDataStream(dataStream, {
+            sendReasoning: true,
+          });
+        } catch (streamError) {
+          console.error('[ROUTE] Stream error details:', {
+            name: streamError instanceof Error ? streamError.name : 'Unknown',
+            message:
+              streamError instanceof Error
+                ? streamError.message
+                : String(streamError),
+            stack: streamError instanceof Error ? streamError.stack : undefined,
+          });
+          throw streamError;
+        }
       },
       onError: (error: unknown) => {
-        console.error('Error:', error);
+        console.error('[ROUTE] DataStream error:', error);
         return `${error}`;
       },
     });
   } catch (error) {
+    console.error('[ROUTE] Main POST error:', error);
     const JSONerror = JSON.stringify(error, null, 2);
     return new Response(
       `An error occurred while processing your request! ${JSONerror}`,
       {
-        status: 404,
+        status: 500,
       },
     );
   }

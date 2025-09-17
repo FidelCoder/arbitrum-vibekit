@@ -27,6 +27,18 @@ services:
       - 3005:3005
     restart: unless-stopped
 
+  coingecko-mcp-server:
+    build:
+      context: ./
+      dockerfile: lib/mcp-tools/coingecko-mcp-server/Dockerfile
+    container_name: vibekit-coingecko-mcp-server
+    env_file:
+      - path: .env
+        required: true
+    ports:
+      - 3011:3011
+    restart: unless-stopped
+
   # langgraph-workflow-agent:
   #   build:
   #     context: ./
@@ -54,6 +66,20 @@ services:
   #   ports:
   #     - 3007:3007
   #   restart: unless-stopped
+
+  rwa-investment-agent:
+    build:
+      context: ./
+      dockerfile: templates/rwa-investment-agent/Dockerfile
+    container_name: vibekit-rwa-investment-agent
+    env_file:
+      - path: .env
+        required: true
+      - path: templates/rwa-investment-agent/.env
+        required: false
+    ports:
+      - 3008:3008
+    restart: unless-stopped
 
   # allora-price-prediction-agent:
   #   build:
